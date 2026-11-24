@@ -1,11 +1,14 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   ArrowRight,
   CheckCircle2,
+  Clock,
+  Flame,
   XCircle,
 } from 'lucide-react';
-import type { QuizQuestion } from '../data/questions';
+import { getLevelInfo, type QuizQuestion } from '../data/questions';
+import { playTickWarningSound } from '../utils/sound';
 import { CodeBlock } from './CodeBlock';
 
 interface QuizScreenProps {
@@ -13,8 +16,12 @@ interface QuizScreenProps {
   questionIndex: number;
   totalQuestions: number;
   score: number;
-  selectedOption: number | null;
+  streak: number;
+  lastPoints: { base: number; bonus: number } | null;
+  selectedOption: number | null; // null = aguardando, -1 = tempo esgotado, 0..3 = alternativa
+  muted: boolean;
   onSelectOption: (optionIndex: number) => void;
+  onTimeout: () => void;
   onNext: () => void;
 }
 
@@ -25,18 +32,66 @@ export function QuizScreen({
   questionIndex,
   totalQuestions,
   score,
+  streak,
+  lastPoints,
   selectedOption,
+  muted,
   onSelectOption,
+  onTimeout,
   onNext,
 }: QuizScreenProps) {
-  const hasAnswered = selectedOption !== null;
-  const isCorrect = hasAnswered && selectedOption === question.correctIndex;
-  const isLastQuestion = questionIndex === totalQuestions - 1;
-  const progressPercent = ((questionIndex + (hasAnswered ? 1 : 0)) / totalQuestions) * 100;
+  const levelInfo = getLevelInfo(question.level);
+  const [timeLeft, setTimeLeft] = useState<number>(levelInfo.timeLimit);
 
+  const hasAnswered = selectedOption !== null;
+  const timedOut = selectedOption === -1;
+  const isCorrect =
+    hasAnswered && !timedOut && selectedOption === question.correctIndex;
+  const isLastQuestion = questionIndex === totalQuestions - 1;
+  const progressPercent =
+    ((questionIndex + (hasAnswered ? 1 : 0)) / totalQuestions) * 100;
+  const timerPercent = Math.max(0, (timeLeft / levelInfo.timeLimit) * 100);
+
+  // Reinicia cronômetro ao trocar de pergunta
+  useEffect(() => {
+    setTimeLeft(levelInfo.timeLimit);
+  }, [question.id, levelInfo.timeLimit]);
+
+  // Contagem regressiva
+  useEffect(() => {
+    if (hasAnswered) return;
+
+    const timer = window.setInterval(() => {
+      setTimeLeft((prev) => {
+        if (prev <= 1) {
+          window.clearInterval(timer);
+          return 0;
+        }
+        const next = prev - 1;
+        if (next <= 5 && next > 0) {
+          playTickWarningSound(muted);
+        }
+        return next;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [hasAnswered, question.id, muted]);
+
+  // Dispara timeout quando o relógio chega a 0
+  useEffect(() => {
+    if (timeLeft === 0 && !hasAnswered) {
+      onTimeout();
+    }
+  }, [timeLeft, hasAnswered, onTimeout]);
+
+  // Atalhos de teclado: 1-4 / A-D para responder, Enter para avançar
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement
+      ) {
         return;
       }
 
@@ -66,6 +121,20 @@ export function QuizScreen({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [hasAnswered, onSelectOption, onNext]);
 
+  const timerColor =
+    timeLeft <= 5
+      ? 'text-rose-400'
+      : timeLeft <= 10
+        ? 'text-amber-300'
+        : 'text-cyan-300';
+
+  const timerBarGradient =
+    timeLeft <= 5
+      ? 'from-rose-500 to-orange-500'
+      : timeLeft <= 10
+        ? 'from-amber-400 to-orange-400'
+        : 'from-cyan-400 to-blue-500';
+
   return (
     <motion.section
       key={question.id}
@@ -75,56 +144,100 @@ export function QuizScreen({
       transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
       className="mx-auto w-full max-w-3xl"
     >
-      {/* HUD do jogo: progresso e pontuação visíveis sem poluição */}
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-2 px-1 text-sm">
-        <div className="flex items-center gap-2 text-slate-300">
-          <span className="font-semibold text-white tabular-nums">
-            Pergunta {String(questionIndex + 1).padStart(2, '0')} de{' '}
-            {totalQuestions}
+      {/* HUD Superior: Nível, Pergunta, Categoria, Pontos, Sequência e Cronômetro */}
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 px-1 text-sm">
+        <div className="flex flex-wrap items-center gap-2 text-slate-300">
+          <span className={`font-display font-bold ${levelInfo.textColor}`}>
+            Nível {levelInfo.level}: {levelInfo.name}
           </span>
-          <span aria-hidden="true" className="text-slate-500">
+          <span aria-hidden="true" className="text-slate-600">
             ·
           </span>
-          <span className="text-sky-300">{question.category}</span>
+          <span className="font-semibold text-white tabular-nums">
+            {String(questionIndex + 1).padStart(2, '0')}/{totalQuestions}
+          </span>
+          <span aria-hidden="true" className="text-slate-600">
+            ·
+          </span>
+          <span className="text-slate-300">{question.category}</span>
         </div>
 
-        <div className="flex items-center gap-2 text-slate-300">
-          <span>Pontuação:</span>
-          <span className="font-display text-lg font-bold text-white tabular-nums">
-            {score}
-          </span>
-          <span className="text-slate-400 tabular-nums">
-            / {totalQuestions * 10} pts
-          </span>
+        <div className="flex items-center gap-4">
+          {/* Sequência de acertos */}
+          <div
+            className="flex items-center gap-1.5 text-sm"
+            title="Sequência atual de acertos"
+          >
+            <Flame
+              className={`h-4 w-4 ${streak >= 2 ? 'text-amber-400' : 'text-slate-500'}`}
+              aria-hidden="true"
+            />
+            <span
+              className={`font-semibold tabular-nums ${
+                streak >= 2 ? 'text-amber-300' : 'text-slate-400'
+              }`}
+            >
+              {streak}x
+            </span>
+          </div>
+
+          {/* Pontuação */}
+          <div className="flex items-center gap-1.5 text-slate-300">
+            <span>Pontos:</span>
+            <span className="font-display text-lg font-bold text-white tabular-nums">
+              {score}
+            </span>
+          </div>
+
+          {/* Cronômetro */}
+          <div
+            className={`flex items-center gap-1.5 font-mono text-sm font-bold tabular-nums ${timerColor}`}
+            aria-label={`Tempo restante: ${timeLeft} segundos`}
+          >
+            <Clock className="h-4 w-4" aria-hidden="true" />
+            <span>{String(timeLeft).padStart(2, '0')}s</span>
+          </div>
         </div>
       </div>
 
-      {/* Barra de progresso suave */}
-      <div
-        className="mb-6 h-2 w-full overflow-hidden rounded-full bg-[#131B3A]"
-        role="progressbar"
-        aria-valuenow={questionIndex + (hasAnswered ? 1 : 0)}
-        aria-valuemin={0}
-        aria-valuemax={totalQuestions}
-        aria-label="Progresso do quiz"
-      >
-        <motion.div
-          className="h-full rounded-full bg-gradient-to-r from-blue-500 via-indigo-500 to-violet-500"
-          initial={false}
-          animate={{ width: `${progressPercent}%` }}
-          transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        />
+      {/* Barra de progresso geral + barra de tempo */}
+      <div className="mb-5 space-y-1.5">
+        <div
+          className="h-2 w-full overflow-hidden rounded-full bg-[#121938]"
+          role="progressbar"
+          aria-valuenow={questionIndex + (hasAnswered ? 1 : 0)}
+          aria-valuemin={0}
+          aria-valuemax={totalQuestions}
+          aria-label="Progresso geral do desafio"
+        >
+          <motion.div
+            className={`h-full rounded-full bg-gradient-to-r ${levelInfo.gradient} shadow-[0_0_12px_rgba(56,189,248,0.5)]`}
+            initial={false}
+            animate={{ width: `${progressPercent}%` }}
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+          />
+        </div>
+
+        <div
+          className="h-1 w-full overflow-hidden rounded-full bg-[#0D132B]"
+          aria-hidden="true"
+        >
+          <div
+            className={`h-full rounded-full bg-gradient-to-r ${timerBarGradient} transition-all duration-500 ease-linear`}
+            style={{ width: `${timerPercent}%` }}
+          />
+        </div>
       </div>
 
-      {/* Superfície principal da pergunta */}
-      <div className="rounded-2xl border border-indigo-400/20 bg-[#101733]/95 p-5 sm:p-8">
+      {/* Superfície da pergunta */}
+      <div className="neon-card rounded-2xl border border-indigo-400/25 bg-[#0C132D]/95 p-5 sm:p-8">
         <h2 className="text-xl font-semibold leading-snug text-white [text-wrap:balance] sm:text-2xl">
           {question.question}
         </h2>
 
         {question.code && <CodeBlock code={question.code} />}
 
-        {/* 4 alternativas grandes e fáceis de clicar */}
+        {/* 4 alternativas grandes e responsivas */}
         <div
           className="mt-6 grid grid-cols-1 gap-3.5"
           role="radiogroup"
@@ -135,26 +248,26 @@ export function QuizScreen({
             const isCorrectOption = idx === question.correctIndex;
 
             let buttonStyle =
-              'border-indigo-300/20 bg-[#151E42]/80 text-slate-100 hover:border-blue-400/60 hover:bg-[#1B2654]';
+              'border-indigo-300/20 bg-[#131C42]/85 text-slate-100 hover:border-cyan-400/65 hover:bg-[#192556] hover:shadow-[0_0_20px_-6px_rgba(56,189,248,0.45)]';
             let keycapStyle =
-              'border-indigo-300/25 bg-[#0D132B] text-sky-300';
+              'border-indigo-300/25 bg-[#090F26] text-cyan-300 group-hover:border-cyan-400/60';
 
             if (hasAnswered) {
               if (isCorrectOption) {
                 buttonStyle =
-                  'border-emerald-400/70 bg-emerald-500/15 text-white';
+                  'border-emerald-400/80 bg-emerald-500/15 text-white shadow-[0_0_22px_-6px_rgba(16,185,129,0.5)]';
                 keycapStyle =
-                  'border-emerald-400/70 bg-emerald-500 text-slate-950 font-bold';
+                  'border-emerald-400 bg-emerald-500 text-slate-950 font-bold';
               } else if (isSelected && !isCorrectOption) {
                 buttonStyle =
-                  'border-rose-400/70 bg-rose-500/15 text-white';
+                  'border-rose-400/80 bg-rose-500/15 text-white shadow-[0_0_20px_-6px_rgba(244,63,94,0.45)]';
                 keycapStyle =
-                  'border-rose-400/70 bg-rose-500 text-white font-bold';
+                  'border-rose-400 bg-rose-500 text-white font-bold';
               } else {
                 buttonStyle =
-                  'border-indigo-300/10 bg-[#0D132B]/60 text-slate-400 opacity-65';
+                  'border-indigo-300/10 bg-[#0A1026]/65 text-slate-400 opacity-60';
                 keycapStyle =
-                  'border-indigo-300/10 bg-[#090E20] text-slate-500';
+                  'border-indigo-300/10 bg-[#070B1A] text-slate-500';
               }
             }
 
@@ -165,8 +278,10 @@ export function QuizScreen({
                 disabled={hasAnswered}
                 onClick={() => onSelectOption(idx)}
                 aria-pressed={isSelected}
-                className={`group flex min-h-[64px] w-full items-center justify-between gap-4 rounded-xl border px-4 py-3.5 text-left transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 sm:px-5 sm:py-4 ${
-                  !hasAnswered ? 'cursor-pointer active:scale-[0.99]' : 'cursor-default'
+                className={`group flex min-h-[64px] w-full items-center justify-between gap-4 rounded-xl border px-4 py-3.5 text-left transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300 sm:px-5 sm:py-4 ${
+                  !hasAnswered
+                    ? 'cursor-pointer active:scale-[0.99]'
+                    : 'cursor-default'
                 } ${buttonStyle}`}
               >
                 <div className="flex items-center gap-3.5 sm:gap-4">
@@ -197,7 +312,7 @@ export function QuizScreen({
           })}
         </div>
 
-        {/* Feedback imediato + explicação educativa */}
+        {/* Feedback imediato + explicação + bônus */}
         <AnimatePresence mode="wait">
           {hasAnswered && (
             <motion.div
@@ -210,7 +325,7 @@ export function QuizScreen({
             >
               <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
                 <div className="space-y-2">
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex flex-wrap items-center gap-2.5">
                     {isCorrect ? (
                       <>
                         <CheckCircle2
@@ -218,7 +333,22 @@ export function QuizScreen({
                           aria-hidden="true"
                         />
                         <span className="font-display text-base font-bold text-emerald-300 sm:text-lg">
-                          Resposta Correta · +10 pontos
+                          Resposta Correta · +{lastPoints?.base ?? 10} pts
+                        </span>
+                        {lastPoints && lastPoints.bonus > 0 && (
+                          <span className="font-display text-sm font-bold text-amber-300 sm:text-base">
+                            · +{lastPoints.bonus} bônus ({streak}x sequência)
+                          </span>
+                        )}
+                      </>
+                    ) : timedOut ? (
+                      <>
+                        <Clock
+                          className="h-5 w-5 shrink-0 text-rose-400"
+                          aria-hidden="true"
+                        />
+                        <span className="font-display text-base font-bold text-rose-300 sm:text-lg">
+                          Tempo Esgotado · +0 pontos
                         </span>
                       </>
                     ) : (
@@ -242,10 +372,12 @@ export function QuizScreen({
                 <button
                   type="button"
                   onClick={onNext}
-                  className="inline-flex min-h-[52px] shrink-0 cursor-pointer items-center justify-center gap-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-7 py-3.5 text-base font-semibold text-white shadow-md shadow-blue-950/50 transition-all duration-150 hover:from-blue-500 hover:to-violet-500 active:scale-[0.98] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 whitespace-nowrap"
+                  className="neon-cta inline-flex min-h-[54px] shrink-0 cursor-pointer items-center justify-center gap-2.5 rounded-xl bg-gradient-to-r from-cyan-500 via-blue-600 to-violet-600 px-7 py-3.5 text-base font-bold text-white transition-all duration-150 hover:from-cyan-400 hover:via-blue-500 hover:to-violet-500 active:scale-[0.98] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300 whitespace-nowrap"
                 >
                   <span>
-                    {isLastQuestion ? 'Ver Resultado Final' : 'Próxima Pergunta'}
+                    {isLastQuestion
+                      ? 'Ver Resultado Final'
+                      : 'Próxima Pergunta'}
                   </span>
                   <ArrowRight className="h-5 w-5" aria-hidden="true" />
                 </button>
